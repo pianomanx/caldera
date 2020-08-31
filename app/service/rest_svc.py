@@ -5,6 +5,7 @@ import os
 import pathlib
 import uuid
 from datetime import time
+import re
 
 import yaml
 from aiohttp import web
@@ -391,27 +392,59 @@ class RestService(RestServiceInterface, BaseService):
             - add parsers back in to current ability
             - save current ability to disk, then re-load ability from file
             - check/set executor timeouts on loaded abilities
+        :param access: Current access list
+        :type access: dict
+        :param ab: Ability to add or
+        :type ab: dict
+        :return: Created / updated ability
+        :rtype: List(Ability)
         """
-        if not ab.get('id') or not ab['id']:
+        # Set ability ID if undefined
+        if not ab.get('id'):
             ab['id'] = str(uuid.uuid4())
+
+        # Validate ID, used for file creation
+        if not self.is_uuid4(ab.get('id')):
+            self.log.debug('Invalid ability ID "{}". ID must be UUID4.'.format(ab.get('id')))
+            return []
+
+        # Validate tactic, used for directory creation
+        tactic_match = re.compile('^[a-zA-Z0-9\-]+$')
+        if not ab.get('tactic') or not tactic_match.match(ab.get('tactic')):
+            self.log.debug('Invalid ability tactic "{}". Tactics can only contain alphanumeric characters and hyphens.'
+                           .format(ab.get('tactic')))
+            return []
+
+        # Validate platforms, ability will not be loaded if empty
+        if not ab.get('platforms'):
+            self.log.debug('At least one platform/executor is required to save ability.')
+            return []
+
+        # Create a new ability to be used for updating/creating
         new_ability, new_ability_exec_timeouts = await self._prep_new_ability(ab)
-        _, file_path = await self.get_service('file_svc').find_file_path('%s.yml' % ab['id'], location='data')
+
+        # Update or create ability
+        _, file_path = await self.get_service('file_svc').find_file_path('{}.yml'.format(ab['id']), location='data')
         if file_path:
-            # exists
+            # Ability exists, update
             current_ability = dict(self.strip_yml(file_path)[0][0])
-            allowed = (await self.get_service('data_svc').locate('abilities',
-                                                                 dict(ability_id=ab['id'])))[0].access
             current_ability, current_parsers = await self._strip_parsers_from_ability(current_ability)
             current_ability.update(new_ability)
             final = await self._add_parsers_to_ability(current_ability, current_parsers)
+            # Get access
+            found_abilities = await self.get_service('data_svc').locate('abilities', dict(ability_id=ab['id']))
+            allowed = found_abilities[0].access if found_abilities else self._get_allowed_from_access(access)
         else:
-            # new
-            d = 'data/abilities/%s' % new_ability.get('tactic')
-            if not os.path.exists(d):
-                os.makedirs(d)
-            file_path = '%s/%s.yml' % (d, new_ability['id'])
-            allowed = self._get_allowed_from_access(access)
+            # Create new ability, create file / directory
+            tactic_dir = os.path.join('data', 'abilities', new_ability.get('tactic'))
+            if not os.path.exists(tactic_dir):
+                os.makedirs(tactic_dir)
+            file_path = '%s/%s.yml' % (tactic_dir, new_ability['id'])
             final = new_ability
+            # Get access
+            allowed = self._get_allowed_from_access(access)
+
+        # Save ability
         with open(file_path, 'w+') as f:
             f.seek(0)
             f.write(yaml.dump([final]))
